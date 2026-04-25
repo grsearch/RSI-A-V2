@@ -22,8 +22,10 @@ const X_BEARER   = process.env.X_BEARER_TOKEN || '';
 const ENABLED    = !!X_BEARER;
 
 const REFRESH_INTERVAL_SEC = parseInt(process.env.X_MENTIONS_INTERVAL_SEC || '7200', 10);
-const BATCH_SIZE           = parseInt(process.env.X_MENTIONS_BATCH_SIZE   || '5',    10);
-const BATCH_GAP_SEC        = parseInt(process.env.X_MENTIONS_BATCH_GAP_SEC || '3',   10);
+// ★ V5-19: 改为串行(每次只发 1 个请求)+ 请求间隔
+//   X API tweets/counts/recent 限制 300/15min = 平均 3s/请求
+//   保守用 15s/请求, 72 个币一轮 ~18 分钟
+const REQUEST_GAP_SEC      = parseInt(process.env.X_MENTIONS_REQUEST_GAP_SEC || '15', 10);
 const REQUEST_TIMEOUT_MS   = parseInt(process.env.X_MENTIONS_TIMEOUT_MS || '10000', 10);
 
 // 持久化路径
@@ -86,8 +88,10 @@ async function _queryOne(address) {
       signal: controller.signal,
     });
     if (res.status === 429) {
-      // 限流: 缓存 statusCode, 让上层知道要退避
-      return { count: null, ts: now, error: 'RATE_LIMIT', statusCode: 429 };
+      // 限流: 读 X 返回的 reset header, 精确等待到解封
+      const resetEpoch = parseInt(res.headers.get('x-rate-limit-reset') || '0', 10);
+      const waitMs = resetEpoch > 0 ? Math.max(0, resetEpoch * 1000 - Date.now()) : 60000;
+      return { count: null, ts: now, error: 'RATE_LIMIT', statusCode: 429, retryAfterMs: waitMs };
     }
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -127,33 +131,29 @@ async function _runOnce() {
       logger.info('[XMentions] 当前无代币, 跳过');
       return;
     }
-    logger.info('[XMentions] 开始一轮刷新, 共 %d 个代币, 每批 %d 个, 批间隔 %ds',
-      addresses.length, BATCH_SIZE, BATCH_GAP_SEC);
+    logger.info('[XMentions] 开始一轮刷新, 共 %d 个代币, 串行间隔 %ds, 预计耗时 %ds',
+      addresses.length, REQUEST_GAP_SEC, addresses.length * REQUEST_GAP_SEC);
 
-    let okCount = 0, failCount = 0, rateLimitHit = false;
-    for (let i = 0; i < addresses.length; i += BATCH_SIZE) {
-      if (rateLimitHit) {
-        logger.warn('[XMentions] 命中 429, 退避 60s');
-        await _sleep(60000);
-        rateLimitHit = false;
-      }
-      const batch = addresses.slice(i, i + BATCH_SIZE);
-      const results = await Promise.all(batch.map(addr => _queryOne(addr)));
-      for (let j = 0; j < batch.length; j++) {
-        const addr = batch[j];
-        const res = results[j];
-        _cache.set(addr, res);
-        if (res.error) {
-          failCount++;
-          if (res.statusCode === 429) rateLimitHit = true;
-        } else {
-          okCount++;
+    let okCount = 0, failCount = 0;
+    for (let i = 0; i < addresses.length; i++) {
+      const addr = addresses[i];
+      const res = await _queryOne(addr);
+      _cache.set(addr, res);
+      if (res.error) {
+        failCount++;
+        // 命中 429: 精确退避到 reset 时间, 避免后续请求继续触发
+        if (res.statusCode === 429 && res.retryAfterMs > 0) {
+          const waitSec = Math.ceil(res.retryAfterMs / 1000);
+          logger.warn('[XMentions] 命中 429, 退避 %ds 到 X API 解封时间', waitSec);
+          await _sleep(res.retryAfterMs + 500); // 加 500ms 缓冲
         }
+      } else {
+        okCount++;
       }
-      // 批间隔(最后一批不等)
-      if (i + BATCH_SIZE < addresses.length && !rateLimitHit) {
-        await _sleep(BATCH_GAP_SEC * 1000);
-      }
+      // 每查 10 个持久化一次, 避免长时间不刷盘
+      if ((i + 1) % 10 === 0) _saveToDisk();
+      // 间隔(最后一个不等)
+      if (i + 1 < addresses.length) await _sleep(REQUEST_GAP_SEC * 1000);
     }
     _saveToDisk();
     logger.info('[XMentions] 一轮完成, 成功 %d, 失败 %d, 耗时 %ds',

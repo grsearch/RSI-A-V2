@@ -413,9 +413,18 @@ function _updateTickCells(tr, d) {
     cells[3].title = `X (Twitter) 过去24小时提及数: ${xm.count}\n更新于 ${ageMin} 分钟前\n查询关键字: 合约地址`;
     cells[3].style.cursor = 'help';
   } else if (xm && xm.error) {
-    cells[3].textContent = '!';
+    // 限流 → 显示沙漏; 其他错误 → 显示 !
+    const isRateLimit = xm.error === 'RATE_LIMIT';
+    cells[3].textContent = isRateLimit ? '⏳' : '!';
     cells[3].style.cssText = 'color:#f0883e;font-size:11px;cursor:help';
-    cells[3].title = `X 查询失败: ${xm.error}\n${xm.ageSec ? '更新于 ' + Math.round(xm.ageSec/60) + ' 分钟前' : ''}`;
+    const ageMin = xm.ageSec ? Math.round(xm.ageSec / 60) : 0;
+    const errMap = {
+      'RATE_LIMIT': '限流, 等待解封',
+      'TIMEOUT':    'HTTP 超时',
+      'NO_TOTAL':   'X 返回无 total_tweet_count',
+    };
+    const errDesc = errMap[xm.error] || xm.error;
+    cells[3].title = `X 查询失败: ${errDesc}\n更新于 ${ageMin} 分钟前\n下次重试时间: 等下一轮(默认2h)`;
   } else {
     cells[3].textContent = '-';
     cells[3].style.cssText = 'color:#6e7681;font-size:11px';
