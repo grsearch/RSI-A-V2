@@ -23,7 +23,7 @@ const logger = require('./logger');
 const JUP_API          = process.env.JUPITER_API_URL           || 'https://api.jup.ag';
 const JUP_API_KEY      = process.env.JUPITER_API_KEY           || '';
 const SLIPPAGE_BPS     = parseInt(process.env.SLIPPAGE_BPS     || '500');
-const TRADE_SOL        = parseFloat(process.env.TRADE_SIZE_SOL || '0.2');
+const TRADE_SOL        = parseFloat(process.env.TRADE_SIZE_SOL || '1');
 const SLIPPAGE_MAX_BPS = parseInt(process.env.SLIPPAGE_MAX_BPS || '2000');
 const MAX_RETRY        = parseInt(process.env.TRADE_MAX_RETRY  || '3');  // 止损时重试少一些
 

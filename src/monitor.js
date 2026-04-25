@@ -32,7 +32,7 @@ const LP_EXIT           = parseFloat(process.env.LP_EXIT_USD         || '10000')
 const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10);
 const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '300', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
-const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '0.2');
+const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '1');
 const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '1800', 10); // 默认30分钟
 const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10);
 const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);  // ★ V5: 最大监控数
@@ -45,6 +45,12 @@ const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 
 const HIST_FETCH_GAP_MS = parseInt(process.env.HIST_FETCH_GAP_MS || '1200', 10);
 const HIST_RETRY_MAX    = parseInt(process.env.HIST_RETRY_MAX    || '5',   10);
 const HIST_RETRY_BASE_MS = parseInt(process.env.HIST_RETRY_BASE_MS || '5000', 10);
+
+// ★ V5-16: 实时 OHLCV K 线刷新（每 OHLCV_REFRESH_SEC 秒拉一次最新K线，替代不准的 ticks 聚合）
+//   默认开启 (true)。如果出问题想回退旧逻辑，设为 false 即可。
+const OHLCV_REALTIME_ENABLED = (process.env.OHLCV_REALTIME_ENABLED || 'true') === 'true';
+// 实时刷新只在主轮询里需要的少量 K 线（够算 RSI 和 EMA99 即可）
+const OHLCV_REALTIME_BARS = parseInt(process.env.OHLCV_REALTIME_BARS || '120', 10);
 
 class HistFetchQueue {
   constructor() {
@@ -516,6 +522,67 @@ class TokenMonitor extends EventEmitter {
     }
   }
 
+  // ★ V5-16: 获取用于 RSI/EMA 计算的 K 线序列
+  //   开关开启时：用 Birdeye OHLCV 实时刷新（精准）+ Helius 量能合并
+  //   开关关闭时：用 ticks 实时聚合 + 历史K线（旧逻辑）
+  //   返回 { closedCandles, currentCandle, source }
+  async _getCurrentCandles(state) {
+    const address = state.address;
+    if (OHLCV_REALTIME_ENABLED) {
+      // 优先尝试 Birdeye OHLCV
+      const candles = await birdeye.getRecentOHLCV(address, KLINE_SEC, OHLCV_REALTIME_BARS);
+      if (candles && candles.length > 0) {
+        // ★ 把 Helius 链上交易聚合的 buyVolume/sellVolume 合并进来
+        //   遍历 state.ticks 里的 chain tick，按 K 线时间桶累加
+        const intervalMs = KLINE_SEC * 1000;
+        const volByBucket = new Map();
+        for (const t of (state.ticks || [])) {
+          if (t.source !== 'chain') continue;
+          const bucket = Math.floor(t.ts / intervalMs) * intervalMs;
+          let v = volByBucket.get(bucket);
+          if (!v) { v = { buyVolume: 0, sellVolume: 0, volume: 0 }; volByBucket.set(bucket, v); }
+          const amt = t.solAmount || 0;
+          v.volume += amt;
+          if (t.isBuy) v.buyVolume += amt; else v.sellVolume += amt;
+        }
+        // 给每根 K 线注入对应桶的量能（Birdeye OHLCV 自带 volume 字段是 token 数量，不是 SOL，覆盖）
+        for (const c of candles) {
+          const v = volByBucket.get(c.openTime);
+          if (v) {
+            c.volume     = v.volume;
+            c.buyVolume  = v.buyVolume;
+            c.sellVolume = v.sellVolume;
+          } else {
+            // 没有链上数据时设为 0
+            c.buyVolume  = 0;
+            c.sellVolume = 0;
+          }
+        }
+        // currentCandle 用最新一根 K 线 + 实时价格覆盖 close
+        const currentCandle = candles.length > 0 ? { ...candles[candles.length - 1] } : null;
+        if (currentCandle && state._lastPriceUsd) {
+          currentCandle.close = state._lastPriceUsd;
+          if (state._lastPriceUsd > currentCandle.high) currentCandle.high = state._lastPriceUsd;
+          if (state._lastPriceUsd < currentCandle.low)  currentCandle.low  = state._lastPriceUsd;
+        }
+        return { closedCandles: candles, currentCandle, source: 'birdeye_ohlcv' };
+      }
+      // Birdeye OHLCV 拉不到 → fallback 到旧逻辑
+      logger.debug('[Monitor] %s OHLCV 拉取失败, fallback 到 ticks 聚合', state.symbol);
+    }
+
+    // 旧逻辑：ticks 聚合 + 历史K线合并
+    const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);
+    const liveClosed = filterValidCandles(rawClosedCandles);
+    let closedCandles = liveClosed;
+    if (state.historicalCandles && state.historicalCandles.length > 0) {
+      const liveStart = liveClosed.length > 0 ? liveClosed[0].openTime : Infinity;
+      const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
+      closedCandles = [...histFiltered, ...liveClosed];
+    }
+    return { closedCandles, currentCandle, source: 'ticks_aggregated' };
+  }
+
   // ── Helius 链上交易回调 ──────────────────────────────────────
 
   _onChainTrade(address, trade) {
@@ -627,16 +694,9 @@ class TokenMonitor extends EventEmitter {
         }
 
         // ── 2. RSI 卖出检查（双重方式：已收盘K线 + stepRSI实时估算） ──
-        if (state.ticks.length > 0) {
-          const { closed: rawCandles } = buildCandles(state.ticks, KLINE_SEC);
-          const liveCandles = filterValidCandles(rawCandles);
-          // ★ 合并历史K线
-          let closedCandles = liveCandles;
-          if (state.historicalCandles && state.historicalCandles.length > 0) {
-            const liveStart2 = liveCandles.length > 0 ? liveCandles[0].openTime : Infinity;
-            const histFiltered2 = state.historicalCandles.filter(c => c.openTime < liveStart2);
-            closedCandles = [...histFiltered2, ...liveCandles];
-          }
+        // ★ V5-16: K 线来源由 _getCurrentCandles 决定（OHLCV 实时刷新 or ticks 聚合）
+        const { closedCandles } = await this._getCurrentCandles(state);
+        if (closedCandles && closedCandles.length > 0) {
           if (closedCandles.length >= RSI_CONFIG.RSI_PERIOD + 2) {
             const closes = closedCandles.map(c => c.close);
             const { rsiArray, avgGain, avgLoss } = calcRSIWithState(closes);
@@ -776,18 +836,19 @@ class TokenMonitor extends EventEmitter {
     }
 
     // 4. FDV/LP 检查（只用缓存值，巡检会定期刷新）
+    //    ★ V5-16: 只在 无持仓 时才退出监控；持仓中即使 FDV/LP 跌破也保留，等正常出场
     const fdv = birdeye.getCachedFdv(address);
     if (fdv !== null && Number.isFinite(fdv)) {
       state.fdv = fdv;  // 更新state
-      if (fdv < FDV_EXIT) {
-        logger.warn('[Monitor] %s FDV=$%d < $%d，退出', state.symbol, Math.round(fdv), FDV_EXIT);
+      if (fdv < FDV_EXIT && !state.inPosition) {
+        logger.warn('[Monitor] %s FDV=$%d < $%d，退出（无持仓）', state.symbol, Math.round(fdv), FDV_EXIT);
         await this.removeToken(address, `FDV_TOO_LOW($${Math.round(fdv)})`);
         return;
       }
     }
     // LP 退出检查（用 state 中巡检更新的值）
-    if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT) {
-      logger.warn('[Monitor] %s LP=$%d < $%d，退出', state.symbol, Math.round(state.lp), LP_EXIT);
+    if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT && !state.inPosition) {
+      logger.warn('[Monitor] %s LP=$%d < $%d，退出（无持仓）', state.symbol, Math.round(state.lp), LP_EXIT);
       await this.removeToken(address, `LP_TOO_LOW($${Math.round(state.lp)})`);
       return;
     }
@@ -801,16 +862,8 @@ class TokenMonitor extends EventEmitter {
       else if (idx === -1) state.ticks.length = 0;  // 全部过期
     }
 
-    // 6. 聚合 K 线（历史K线 + 实时ticks合并）
-    const { closed: rawClosedCandles, current: currentCandle } = buildCandles(state.ticks, KLINE_SEC);
-    const liveClosed = filterValidCandles(rawClosedCandles);
-    // ★ 合并历史K线：历史candles在前，实时candles在后，去除时间重叠部分
-    let closedCandles = liveClosed;
-    if (state.historicalCandles && state.historicalCandles.length > 0) {
-      const liveStart = liveClosed.length > 0 ? liveClosed[0].openTime : Infinity;
-      const histFiltered = state.historicalCandles.filter(c => c.openTime < liveStart);
-      closedCandles = [...histFiltered, ...liveClosed];
-    }
+    // 6. 聚合 K 线（V5-16: 优先 Birdeye OHLCV 实时刷新，fallback 到 ticks 聚合）
+    const { closedCandles, currentCandle } = await this._getCurrentCandles(state);
 
     // 7. RSI + 量能信号评估
     const realtimePrice = currentCandle?.close ?? price;
@@ -1211,16 +1264,16 @@ class TokenMonitor extends EventEmitter {
         if (overview.liquidity !== null && Number.isFinite(overview.liquidity)) state.lp = overview.liquidity;
         if (overview.createdAt) state.createdAt = overview.createdAt; // ★ 始终更新，确保Age数据存在
 
-        // ★ FDV 退出检查
-        if (state.fdv !== null && Number.isFinite(state.fdv) && state.fdv < FDV_EXIT) {
-          logger.warn('[Patrol] %s FDV=$%d < $%d，退出监控', state.symbol, Math.round(state.fdv), FDV_EXIT);
+        // ★ FDV 退出检查（V5-16: 持仓中不退出）
+        if (state.fdv !== null && Number.isFinite(state.fdv) && state.fdv < FDV_EXIT && !state.inPosition) {
+          logger.warn('[Patrol] %s FDV=$%d < $%d，退出监控（无持仓）', state.symbol, Math.round(state.fdv), FDV_EXIT);
           await this.removeToken(address, `FDV_TOO_LOW($${Math.round(state.fdv)})`);
           continue;
         }
 
-        // ★ LP 退出检查
-        if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT) {
-          logger.warn('[Patrol] %s LP=$%d < $%d，退出监控', state.symbol, Math.round(state.lp), LP_EXIT);
+        // ★ LP 退出检查（V5-16: 持仓中不退出）
+        if (state.lp !== null && Number.isFinite(state.lp) && state.lp < LP_EXIT && !state.inPosition) {
+          logger.warn('[Patrol] %s LP=$%d < $%d，退出监控（无持仓）', state.symbol, Math.round(state.lp), LP_EXIT);
           await this.removeToken(address, `LP_TOO_LOW($${Math.round(state.lp)})`);
           continue;
         }

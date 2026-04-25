@@ -217,6 +217,8 @@ async function _fetchOverview(address) {
       createdAt: data.createdAt ? data.createdAt * 1000 : (data.createAt ? data.createAt * 1000 : null),
       // ★ V5-12: 24h 交易量(USD)，用于淘汰判断（比本地 ticks 累计更准确）
       v24hUSD:   typeof v24h === 'number' ? v24h : (v24h ? parseFloat(v24h) : null),
+      // ★ V5-16: 代币 symbol，用于 add 接口自动匹配
+      symbol:    data.symbol ?? null,
       ts:        Date.now(),
     };
     // 保留旧缓存中的 createdAt（不会变）
@@ -357,6 +359,30 @@ async function getFdvFresh(address) {
   return entry?.fdv ?? null;
 }
 
+// ★ V5-16: 获取代币 symbol（从 token_overview 缓存里读）
+async function getSymbol(address) {
+  // 走缓存的 _fetchOverview 路径，需要在 entry 里也保存 symbol
+  const entry = await _fetchOverview(address);
+  return entry?.symbol ?? null;
+}
+
+// ★ V5-16: 实时 OHLCV 刷新 —— 给 RSI 计算用，每 N 秒拉一次最新 K 线
+//   带 TTL 缓存，避免频繁请求；命中缓存直接返回，不发 HTTP。
+const _ohlcvCache = new Map(); // address+interval → { candles, ts }
+const OHLCV_REFRESH_SEC = parseInt(process.env.OHLCV_REFRESH_SEC || '30', 10);
+
+async function getRecentOHLCV(address, intervalSec, bars = 50) {
+  const cacheKey = `${address}_${intervalSec}_${bars}`;
+  const cached = _ohlcvCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < OHLCV_REFRESH_SEC * 1000) {
+    return cached.candles;
+  }
+  const candles = await getOHLCV(address, intervalSec, bars);
+  // 缓存（哪怕是空数组也缓存，避免失败时反复重试）
+  _ohlcvCache.set(cacheKey, { candles, ts: Date.now() });
+  return candles;
+}
+
 async function getLiquidity(address) {
   const entry = await _fetchOverview(address);
   return entry?.liquidity ?? null;
@@ -492,4 +518,4 @@ async function getOHLCV(address, intervalSec, bars = 150) {
   }
 }
 
-module.exports = { getPrice, getPriceFailStatus, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getV24hUSD, getOverview, clearCache, priceStream, getOHLCV };
+module.exports = { getPrice, getPriceFailStatus, getFdv, getCachedFdv, getFdvFresh, getLiquidity, getV24hUSD, getOverview, getSymbol, getRecentOHLCV, clearCache, priceStream, getOHLCV };

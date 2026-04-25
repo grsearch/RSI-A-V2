@@ -4,6 +4,7 @@ const router    = express.Router();
 const monitor   = require('../monitor');
 const reporter  = require('../reporter');
 const dataStore = require('../dataStore');
+const birdeye   = require('../birdeye');
 
 router.get('/dashboard', (_req, res) => res.json({
   tokens: monitor.getTokens(),
@@ -18,7 +19,14 @@ router.post('/tokens/add', async (req, res) => {
   if (!address) {
     return res.status(400).json({ error: '缺少 address' });
   }
-  const sym = symbol || address.slice(0, 6);
+  // ★ V5-16: symbol 自动匹配 —— 没传就从 Birdeye 查
+  let sym = symbol;
+  if (!sym) {
+    try {
+      sym = await birdeye.getSymbol(address);
+    } catch (_) {}
+  }
+  if (!sym) sym = address.slice(0, 6); // 兜底
   const added = await monitor.addToken(address, sym, { network: 'solana', source: 'manual' });
   if (!added) {
     return res.status(409).json({ error: '代币已在监控中', address });

@@ -554,7 +554,7 @@ function main() {
     trailingStopEnabled:  (args['trailing-stop'] || process.env.TRAILING_STOP_ENABLED || 'true') === 'true',
     trailingStopActivate: parseFloat(args['trailing-activate'] || process.env.TRAILING_STOP_ACTIVATE || '30'),
     trailingStopPct:      parseFloat(args['trailing-pct']      || process.env.TRAILING_STOP_PCT      || '-20'),
-    tradeSizeSol:       parseFloat(args['trade-size']     || process.env.TRADE_SIZE_SOL || '0.2'),
+    tradeSizeSol:       parseFloat(args['trade-size']     || process.env.TRADE_SIZE_SOL || '1'),
     maxTrades:          parseInt(args['max-trades'] || '99999', 10),
   };
 
