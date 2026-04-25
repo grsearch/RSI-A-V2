@@ -92,7 +92,7 @@
     </div>
     <table id="tbl-tokens">
       <thead><tr>
-        <th>代币</th><th>合约</th><th>价格</th><th>FDV</th><th>LP</th><th>Age</th>
+        <th>代币</th><th>合约</th><th>价格</th><th title="X (Twitter) 过去24小时提及数, 每2小时刷新">X提及</th><th>FDV</th><th>LP</th>
         <th>RSI</th><th>prevRSI</th><th>Buy/Sell</th><th>信号</th><th>原因</th>
         <th>K线</th><th>交易</th><th>状态</th><th>操作</th>
       </tr></thead>
@@ -399,9 +399,30 @@ function _updateTickCells(tr, d) {
     cells[2].style.cssText = '';
     cells[2].title = '';
   }
-  cells[3].textContent = fmtFdv(d.fdv); cells[3].className = 'fdv-val';
-  cells[4].textContent = fmtFdv(d.lp);  cells[4].className = 'lp-val';
-  cells[5].textContent = fmtAge(d.createdAt); cells[5].style.cssText = 'color:#8b949e;font-size:11px';
+  // ★ V5-18: X 提及 24h 计数 (cells[3])
+  const xm = d.xMentions;
+  if (xm && xm.count !== null && xm.count !== undefined) {
+    cells[3].textContent = xm.count >= 1000 ? (xm.count / 1000).toFixed(1) + 'K' : String(xm.count);
+    // 颜色编码: 0 灰, 1-50 普通, 50-500 蓝, 500+ 紫(高热度)
+    const c = xm.count;
+    if (c === 0) cells[3].style.cssText = 'color:#6e7681;font-size:11px';
+    else if (c < 50) cells[3].style.cssText = 'color:#c9d1d9;font-size:11px';
+    else if (c < 500) cells[3].style.cssText = 'color:#58a6ff;font-weight:bold;font-size:11px';
+    else cells[3].style.cssText = 'color:#bc8cff;font-weight:bold;font-size:11px';
+    const ageMin = Math.round(xm.ageSec / 60);
+    cells[3].title = `X (Twitter) 过去24小时提及数: ${xm.count}\n更新于 ${ageMin} 分钟前\n查询关键字: 合约地址`;
+    cells[3].style.cursor = 'help';
+  } else if (xm && xm.error) {
+    cells[3].textContent = '!';
+    cells[3].style.cssText = 'color:#f0883e;font-size:11px;cursor:help';
+    cells[3].title = `X 查询失败: ${xm.error}\n${xm.ageSec ? '更新于 ' + Math.round(xm.ageSec/60) + ' 分钟前' : ''}`;
+  } else {
+    cells[3].textContent = '-';
+    cells[3].style.cssText = 'color:#6e7681;font-size:11px';
+    cells[3].title = 'X 提及数据未拉取 (启动后 30 秒开始首轮, 或 X_BEARER_TOKEN 未配置)';
+  }
+  cells[4].textContent = fmtFdv(d.fdv); cells[4].className = 'fdv-val';
+  cells[5].textContent = fmtFdv(d.lp);  cells[5].className = 'lp-val';
   cells[6].textContent = rsi == null ? '预热' : rsi.toFixed(2);
   cells[6].className = rsiClass(rsi);
   cells[7].textContent = d.prevRsi == null ? '-' : d.prevRsi.toFixed(2);

@@ -26,6 +26,7 @@ const logger    = require('./logger');
 const wsHub     = require('./wsHub');
 const dataStore = require('./dataStore');
 const heliusWs  = require('./heliusWs');
+const xMentions = require('./xMentions');
 
 const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '30000');  // ★ V5: 改为3万
 const LP_EXIT           = parseFloat(process.env.LP_EXIT_USD         || '10000');  // ★ V5: LP<1万退出
@@ -170,6 +171,9 @@ class TokenMonitor extends EventEmitter {
     this._startOverviewPatrol();
     logger.info('[Monitor]   FDV退出<$%d  LP退出<$%d  最大监控=%d  巡检=%ds',
       FDV_EXIT, LP_EXIT, MAX_TOKENS, OVERVIEW_PATROL_SEC);
+
+    // ★ V5-18: X mentions 24h 计数定时刷新（默认 2 小时一轮）
+    xMentions.start(() => Array.from(this._tokens.keys()));
   }
 
   async _loadPersistedTokens() {
@@ -558,14 +562,21 @@ class TokenMonitor extends EventEmitter {
             c.sellVolume = 0;
           }
         }
-        // currentCandle 用最新一根 K 线 + 实时价格覆盖 close
-        const currentCandle = candles.length > 0 ? { ...candles[candles.length - 1] } : null;
-        if (currentCandle && state._lastPriceUsd) {
-          currentCandle.close = state._lastPriceUsd;
-          if (state._lastPriceUsd > currentCandle.high) currentCandle.high = state._lastPriceUsd;
-          if (state._lastPriceUsd < currentCandle.low)  currentCandle.low  = state._lastPriceUsd;
+        // ★ V5-17: 把实时价格写回最新一根 K 线 close
+        //   Birdeye OHLCV 数据有 30s 缓存 + 服务端延迟，最新一根 close 滞后于实时价格
+        //   evaluateSignal 用 closedCandles 算 stepRSI 时，lastClose 必须是实时的，否则 RSI 跟不上
+        //   做法: 深拷贝最后一根，把 close 替换为实时价；high/low 也同步更新
+        const closedOut = candles.slice();
+        if (closedOut.length > 0 && state._lastPriceUsd && state._lastPriceUsd > 0) {
+          const last = { ...closedOut[closedOut.length - 1] };
+          last.close = state._lastPriceUsd;
+          if (state._lastPriceUsd > last.high) last.high = state._lastPriceUsd;
+          if (state._lastPriceUsd < last.low)  last.low  = state._lastPriceUsd;
+          closedOut[closedOut.length - 1] = last;
         }
-        return { closedCandles: candles, currentCandle, source: 'birdeye_ohlcv' };
+        // currentCandle 同样用实时价覆盖（保持原有逻辑）
+        const currentCandle = closedOut.length > 0 ? { ...closedOut[closedOut.length - 1] } : null;
+        return { closedCandles: closedOut, currentCandle, source: 'birdeye_ohlcv' };
       }
       // Birdeye OHLCV 拉不到 → fallback 到旧逻辑
       logger.debug('[Monitor] %s OHLCV 拉取失败, fallback 到 ticks 聚合', state.symbol);
@@ -722,9 +733,18 @@ class TokenMonitor extends EventEmitter {
             const rsiRealtime = stepRSI(avgGain, avgLoss, closes[len - 1], price);
             const rsiClosedLast = rsiArray[len - 1];  // 最新已收盘K线RSI（作为 prev 参考）
 
-            // 取上一次轮询的实时 RSI 作为 prevRsi
-            const prevRsiPoll = state._slPollPrevRsi;
-            state._slPollPrevRsi = rsiRealtime;  // 保存本次，供下次比较
+            // ★ V5-17: _slPollPrevRsi 加时效保护
+            //   旧逻辑：直接用 state._slPollPrevRsi，没有时间戳。
+            //   如果某轮轮询被卡住或币暂时跳过，再次跑时 prev 是几分钟前的值，
+            //   和当前 rsiRealtime 比较会产生虚假下穿（如 71.0→69.4 实际从未发生）。
+            //   修复：用 _slPollPrevRsiTs 记录时间戳，超过 STALE 视为失效，跳过本次下穿判断。
+            const SL_PREV_STALE_MS = parseInt(process.env.SL_POLL_PREV_STALE_MS || '3000', 10);
+            const slPrevTs = state._slPollPrevRsiTs || 0;
+            const slIsStale = !Number.isFinite(state._slPollPrevRsi) || (Date.now() - slPrevTs) > SL_PREV_STALE_MS;
+            const prevRsiPoll = slIsStale ? NaN : state._slPollPrevRsi;
+            // 始终更新本次的 prev（无论这次是否触发）
+            state._slPollPrevRsi   = rsiRealtime;
+            state._slPollPrevRsiTs = Date.now();
 
             if (Number.isFinite(rsiRealtime)) {
               // ★ V5: RSI > 80 恐慌卖 — 改为用已收盘K线RSI判断，不用stepRSI
@@ -912,7 +932,9 @@ class TokenMonitor extends EventEmitter {
 
     // 9. 广播实时数据
     const histLen = (state.historicalCandles && state.historicalCandles.length) || 0;
-    const liveLen = liveClosed.length;
+    // ★ V5-17: liveClosed 是 _getCurrentCandles 内部变量, 这里访问不到
+    //   用 closedCandles.length - histLen 反推, 兜底 0
+    const liveLen = Math.max(0, closedCandles.length - histLen);
     wsHub.broadcast({
       type:        'tick',
       address,
@@ -946,6 +968,8 @@ class TokenMonitor extends EventEmitter {
       chainStats:  heliusWs.getTokenStats(address),
       // ★ V5-13: 这个 token 的 Birdeye 价格失败状态（None = 正常）
       priceFail:   birdeye.getPriceFailStatus(address),
+      // ★ V5-18: X (Twitter) 24h 提及数（每 2 小时刷新一次, null=未拉取）
+      xMentions:   xMentions.getMentions(address),
       // ★ V5-14: 决策追踪（最近一次 evaluateSignal 的完整上下文）
       signalTrace: state._signalTrace || null,
     });
